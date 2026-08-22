@@ -1,9 +1,6 @@
 services:
   barproxy:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile
-    image: bar-proxy:latest
+    image: ghcr.io/onixldlc/bar-proxy:latest
     container_name: bar-proxy
     restart: unless-stopped
     ports:
