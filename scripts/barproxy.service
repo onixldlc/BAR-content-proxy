@@ -1,0 +1,32 @@
+[Unit]
+Description=BAR-proxy - Beyond All Reason content proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=barproxy
+Group=barproxy
+
+# Adjust both paths to match your install.
+ExecStart=/usr/local/bin/barproxy
+WorkingDirectory=/var/lib/barproxy
+
+Environment=BARPROXY_ADDR=:8080
+Environment=BARPROXY_CACHE_DIR=/var/lib/barproxy/cache
+Environment=BARPROXY_CACHE_MAX_BYTES=53687091200
+Environment=BARPROXY_PARTS=4
+# Set this to the URL your peers reach the box on.
+#Environment=BARPROXY_PUBLIC_URL=http://bar-proxy.example.com:8080
+
+Restart=on-failure
+RestartSec=5s
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/barproxy
+
+[Install]
+WantedBy=multi-user.target

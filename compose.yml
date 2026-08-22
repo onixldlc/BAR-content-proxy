@@ -1,0 +1,39 @@
+services:
+  barproxy:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: bar-proxy:latest
+    container_name: bar-proxy
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    # Literal values on purpose. `${VAR:-default}` interpolation is a
+    # docker-compose feature; podman-compose passes the string through
+    # verbatim, which lands "${BARPROXY_CACHE_MAX_BYTES:-53687091200}" in
+    # the container as a literal. Edit these directly, or point at an env
+    # file with `docker compose --env-file ...`. Every knob is documented
+    # in .env.example.
+    environment:
+      # Set this to the URL your peers actually type. It is baked into the
+      # rewritten repos.gz, so "localhost" here means your friends get sent
+      # back to their own machines. Empty = derive from the Host header.
+      BARPROXY_PUBLIC_URL: ""
+      BARPROXY_PARTS: "4"
+      BARPROXY_CACHE_MAX_BYTES: "53687091200"
+      BARPROXY_VERBOSE: "0"
+    volumes:
+      - barproxy-cache:/var/cache/barproxy
+    # Declared here as well as in the Dockerfile. Docker honours the image's
+    # HEALTHCHECK directly, but podman drops it unless the image is built
+    # with `--format docker` (OCI images have no healthcheck field). A
+    # compose-level healthcheck works on both regardless of image format.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/verify.sh"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+
+volumes:
+  barproxy-cache:

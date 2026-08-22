@@ -1,0 +1,6 @@
+/barproxy
+/cache/
+/dist/
+/distout/
+.env
+*.log

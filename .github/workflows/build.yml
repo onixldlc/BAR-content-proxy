@@ -1,0 +1,238 @@
+name: Build and Push
+
+# Adapted from onixldlc/goldsrc-rcon: same determine-version step, same buildx
+# + ghcr + gha cache, same softprops release step. Differs only where a long
+# running server differs from a one shot CLI:
+#   - the smoke test starts the container and polls /healthz instead of running
+#     `--version`, because barproxy is a server with no version subcommand
+#   - release binaries are cross compiled in the Dockerfile's `dist` stage and
+#     exported, rather than lifted out of the runtime image
+#
+# Every push and PR compiles and tests. Only a pushed tag v* logs in, publishes
+# the image and cuts a release. A tag push and its branch push both run to
+# completion on purpose: the branch run is the safety check, the tag run is the
+# release.
+
+on:
+  push:
+    tags: ["v*"]
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: bar-proxy
+  GO_VERSION: "1.23"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    name: Vet and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt'd:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Build
+        run: CGO_ENABLED=0 go build ./...
+
+      - name: Test
+        # -race because the partial-file readers and the downloader run
+        # concurrently. No-op if no _test.go files exist yet (exit 0).
+        run: go test -race -count=1 ./...
+
+      - name: Assert the dependency list is still empty
+        run: |
+          # The proxy is stdlib-only: nothing unauditable sits between a user
+          # and the content they download. `go list -m all` lists real modules
+          # -- here, just this one.
+          self="$(go list -m)"
+          extra="$(go list -m all | grep -vx "$self" || true)"
+          if [ -n "$extra" ]; then
+            echo "dependencies appeared:"; echo "$extra"; exit 1
+          fi
+          if [ -f go.sum ]; then
+            echo "go.sum appeared, so something got vendored in"; exit 1
+          fi
+          echo "no dependencies: ${self} only"
+
+  determine-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # git describe needs tags and history.
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+            PUBLISH=true
+          else
+            VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+            PUBLISH=false
+          fi
+          # Docker tags allow a narrow character set; sanitise rather than fail.
+          VERSION="$(printf '%s' "${VERSION}" | tr -c 'A-Za-z0-9._-' '-')"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "publish=${PUBLISH}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION} publish=${PUBLISH}"
+
+  build-and-push:
+    name: Build image
+    runs-on: ubuntu-latest
+    needs: [test, determine-version]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build amd64 locally and smoke test it
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: runtime
+          platforms: linux/amd64
+          load: true
+          build-args: |
+            VERSION=${{ needs.determine-version.outputs.version }}
+          tags: ${{ env.IMAGE_NAME }}:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        run: |
+          # Start the server and wait for it to report healthy. A dynamically
+          # linked or crash-on-boot binary never answers /healthz, so this is
+          # the real check that the image runs, not just that it built.
+          docker run -d --rm -p 8080:8080 --name bpci "${IMAGE_NAME}:ci"
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/healthz 2>/dev/null | grep -qx ok; then
+              ok=1; break
+            fi
+            sleep 1
+          done
+          echo "--- container logs ---"
+          docker logs bpci || true
+          docker rm -f bpci || true
+          [ "$ok" = 1 ] || { echo "healthz never returned ok"; exit 1; }
+          echo "healthy"
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+
+      - name: Log in to GitHub Container Registry
+        if: needs.determine-version.outputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push multi-arch
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: runtime
+          platforms: linux/amd64,linux/arm64
+          push: ${{ needs.determine-version.outputs.publish == 'true' }}
+          build-args: |
+            VERSION=${{ needs.determine-version.outputs.version }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ needs.determine-version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          V="${{ needs.determine-version.outputs.version }}"
+          IMG="${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}"
+          echo "**Version:** \`${V}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Published:** ${{ needs.determine-version.outputs.publish }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${IMG}:${V}\` (linux/amd64, linux/arm64)" >> $GITHUB_STEP_SUMMARY
+
+  release:
+    name: Release binaries
+    runs-on: ubuntu-latest
+    needs: [test, determine-version, build-and-push]
+    if: needs.determine-version.outputs.publish == 'true'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Cross compile every release binary
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: dist
+          build-args: |
+            VERSION=${{ needs.determine-version.outputs.version }}
+          outputs: type=local,dest=dist
+          cache-from: type=gha
+
+      - name: Package
+        run: |
+          V="${{ needs.determine-version.outputs.version }}"
+          cd dist
+          ls -l
+          for f in barproxy-*; do
+            case "$f" in
+              *.exe)
+                # Archive members are named plainly, so an extract drops a
+                # `barproxy` (or barproxy.exe) on PATH, not the triple-suffixed
+                # build name.
+                cp "$f" barproxy.exe
+                zip -X "${f%.exe}-${V}.zip" barproxy.exe
+                rm barproxy.exe
+                ;;
+              *)
+                tar -czf "${f}-${V}.tar.gz" --transform='s|.*|barproxy|' "$f"
+                ;;
+            esac
+          done
+          sha256sum *.tar.gz *.zip barproxy-linux-amd64 | tee checksums.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/barproxy-linux-amd64
+            dist/checksums.txt
+
+      - name: Summary
+        run: |
+          V="${{ needs.determine-version.outputs.version }}"
+          echo "**Release:** \`${V}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Assets:** linux amd64/arm64/386, darwin amd64/arm64, windows amd64, \`checksums.txt\`" >> $GITHUB_STEP_SUMMARY
