@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -111,6 +112,19 @@ func (f *Fetcher) forget(url string) {
 	f.mu.Unlock()
 }
 
+// upstreamStatusError is a definitive non-200 answer from upstream: the
+// object is not there, and no fallback will conjure it. Distinct from a
+// transport error, which is worth retrying a different way.
+type upstreamStatusError struct {
+	url    string
+	code   int
+	status string
+}
+
+func (e *upstreamStatusError) Error() string {
+	return "upstream " + e.url + ": " + e.status
+}
+
 // probe asks upstream for size and range support without pulling the body.
 func (f *Fetcher) probe(url string, hdr http.Header) (size int64, ranges bool, ctype, etag string, err error) {
 	req, err := http.NewRequest(http.MethodHead, url, nil)
@@ -127,7 +141,7 @@ func (f *Fetcher) probe(url string, hdr http.Header) (size int64, ranges bool, c
 	io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		return 0, false, "", "", fmt.Errorf("upstream HEAD %s: %s", url, resp.Status)
+		return 0, false, "", "", &upstreamStatusError{url: url, code: resp.StatusCode, status: resp.Status}
 	}
 	ranges = strings.Contains(strings.ToLower(resp.Header.Get("Accept-Ranges")), "bytes")
 	return resp.ContentLength, ranges, resp.Header.Get("Content-Type"), resp.Header.Get("ETag"), nil
@@ -150,6 +164,17 @@ func (f *Fetcher) run(d *download, hdr http.Header) {
 
 	size, ranges, ctype, etag, err := f.probe(d.url, hdr)
 	if err != nil {
+		// 405/501 means the server dislikes HEAD, not that the object is
+		// missing, so a plain GET is still worth trying. Any other definite
+		// status (404, 403, 410) is upstream's real answer and has to reach
+		// the client as such. Falling through would publish the entry as 200
+		// before the body is fetched, so pr-downloader receives a zero-byte
+		// 200 and treats a missing pool object as a valid empty file.
+		var se *upstreamStatusError
+		if errors.As(err, &se) && se.code != http.StatusMethodNotAllowed && se.code != http.StatusNotImplemented {
+			fail(err)
+			return
+		}
 		// HEAD is not universally supported; fall back to a plain stream.
 		if f.cfg.Verbose {
 			log.Printf("fetch: probe failed for %s: %v (falling back to single stream)", d.url, err)

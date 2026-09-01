@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -140,6 +141,16 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, target string) {
 	entry, body, err := s.fetch.Open(r.Context(), target, r.Header)
 	if err != nil {
 		if r.Context().Err() != nil {
+			return
+		}
+		var se *upstreamStatusError
+		if errors.As(err, &se) {
+			// Upstream's answer, not our failure. Forward it verbatim so a
+			// 404 stays a 404 instead of becoming an empty 200.
+			if s.cfg.Verbose {
+				log.Printf("proxy: %s: %s", target, se.status)
+			}
+			http.Error(w, se.status, se.code)
 			return
 		}
 		log.Printf("proxy: %s: %v", target, err)
