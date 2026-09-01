@@ -115,10 +115,10 @@ func (s *Server) handleFind(w http.ResponseWriter, r *http.Request) {
 		// into a 502 hands the client a plaintext body where it expects
 		// JSON, so forward exactly what upstream said instead.
 		if s.cfg.Verbose {
-			   log.Printf("rapid: find %s: %s", target, up.status)
+			log.Printf("rapid: find %s: %s", target, up.status)
 		}
 		if up.ctype != "" {
-			   w.Header().Set("Content-Type", up.ctype)
+			w.Header().Set("Content-Type", up.ctype)
 		}
 		w.Header().Set("X-BAR-Cache", "BYPASS")
 		w.WriteHeader(up.code)
@@ -221,10 +221,10 @@ func (s *Server) fetchUpstream(r *http.Request, target string) (*upstreamResp, e
 func (s *Server) fetchAll(r *http.Request, target string) ([]byte, error) {
 	up, err := s.fetchUpstream(r, target)
 	if err != nil {
-		   return nil, err
+		return nil, err
 	}
 	if up.code != http.StatusOK {
-		   return nil, &httpError{target: target, status: up.status}
+		return nil, &httpError{target: target, status: up.status}
 	}
 	return up.body, nil
 }
