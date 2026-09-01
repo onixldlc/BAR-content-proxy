@@ -101,21 +101,39 @@ func (s *Server) handleFind(w http.ResponseWriter, r *http.Request) {
 		target += "?" + r.URL.RawQuery
 	}
 
-	raw, err := s.fetchAll(r, target)
+	up, err := s.fetchUpstream(r, target)
 	if err != nil {
 		log.Printf("rapid: find fetch: %v", err)
 		http.Error(w, "upstream search unavailable", http.StatusBadGateway)
 		return
 	}
 
+	if up.code != http.StatusOK {
+		// springfiles answers with status codes: 400 for a malformed query
+		// ("Missing category param"), 404 for "File not found in
+		// springfiles". Those are answers, not proxy failures. Turning them
+		// into a 502 hands the client a plaintext body where it expects
+		// JSON, so forward exactly what upstream said instead.
+		if s.cfg.Verbose {
+			   log.Printf("rapid: find %s: %s", target, up.status)
+		}
+		if up.ctype != "" {
+			   w.Header().Set("Content-Type", up.ctype)
+		}
+		w.Header().Set("X-BAR-Cache", "BYPASS")
+		w.WriteHeader(up.code)
+		w.Write(up.body)
+		return
+	}
+
 	base := s.publicBase(r)
-	rewritten, err := s.rewriteFind(raw, base)
+	rewritten, err := s.rewriteFind(up.body, base)
 	if err != nil {
 		// Not JSON we recognise; hand back what upstream said rather than
 		// breaking the client outright.
 		log.Printf("rapid: find rewrite: %v", err)
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(raw)
+		w.Write(up.body)
 		return
 	}
 
@@ -162,8 +180,17 @@ func hostOf(raw string) string {
 	return host
 }
 
-// fetchAll pulls a small control file fully into memory.
-func (s *Server) fetchAll(r *http.Request, target string) ([]byte, error) {
+// upstreamResp is a control-file response held in memory, status included.
+type upstreamResp struct {
+	body   []byte
+	code   int
+	status string
+	ctype  string
+}
+
+// fetchUpstream pulls a small control file fully into memory, preserving the
+// upstream status so the caller can decide what a non-200 means.
+func (s *Server) fetchUpstream(r *http.Request, target string) (*upstreamResp, error) {
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
 	if err != nil {
 		return nil, err
@@ -176,11 +203,30 @@ func (s *Server) fetchAll(r *http.Request, target string) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, &httpError{target: target, status: resp.Status}
-	}
 	// 32 MiB ceiling: these are control files, not archives.
-	return io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	if err != nil {
+		return nil, err
+	}
+	return &upstreamResp{
+		body:   body,
+		code:   resp.StatusCode,
+		status: resp.Status,
+		ctype:  resp.Header.Get("Content-Type"),
+	}, nil
+}
+
+// fetchAll is the strict variant, for callers like repos.gz where anything
+// other than 200 really is a failure.
+func (s *Server) fetchAll(r *http.Request, target string) ([]byte, error) {
+	up, err := s.fetchUpstream(r, target)
+	if err != nil {
+		   return nil, err
+	}
+	if up.code != http.StatusOK {
+		   return nil, &httpError{target: target, status: up.status}
+	}
+	return up.body, nil
 }
 
 type httpError struct {
